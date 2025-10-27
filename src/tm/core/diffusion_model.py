@@ -257,7 +257,7 @@ class DiffusionTrainer(DiffusionModel):
         for epoch in range(num_epochs):
             epoch_train_loss = []
             epoch += self.BB.start_epoch
-            for i, (temperatures, b) in enumerate(train_loader, 0):
+            for i, (index, temperatures, b) in enumerate(train_loader, 0):
                 if b.size(0) != batch_size:
                     continue
                 t = self.sample_times(b.size(0))
@@ -278,12 +278,12 @@ class DiffusionTrainer(DiffusionModel):
 
                 if print_freq:
                     if i % print_freq == 0:
-                        logger.info(f"step: {i}, loss {loss.detach():.3f}")
+                        print(f"step: {i}, loss {loss.detach():.3f}")
 
             if self.test_loader:
                 with torch.no_grad():
                     epoch_test_loss = []
-                    for i, (_, _, _, _, temperatures, b) in enumerate(test_loader, 0):
+                    for i, (index, temperatures, b) in enumerate(test_loader, 0):
                         t = self.sample_times(b.size(0))
                         t_prev = t - 1
                         t_prev[t_prev == -1] = 0
@@ -295,9 +295,9 @@ class DiffusionTrainer(DiffusionModel):
             self.train_losses.append(np.mean(epoch_train_loss))
             if self.test_loader:
                 self.test_losses.append(np.mean(epoch_test_loss))
-                logger.info(f"epoch: {epoch} | train loss: {self.train_losses[-1]:.3f} | test loss: {self.test_losses[-1]:.3f}")
+                print(f"epoch: {epoch} | train loss: {self.train_losses[-1]:.3f} | test loss: {self.test_losses[-1]:.3f}")
             else:
-                logger.info(f"epoch: {epoch} | train loss: {self.train_losses[-1]:.3f}")
+                print(f"epoch: {epoch} | train loss: {self.train_losses[-1]:.3f}")
 
             if self.model_dir:
                 self.BB.save_state(self.model_dir, 'latest', identifier=self.identifier)
@@ -396,7 +396,7 @@ class DiffusionSampler(DiffusionModel):
         # vmap runs *one* forward of f and re-uses its intermediates
         (xt_next, Jv) = vmap(
             lambda v_i: jvp(step_fn, (xt,), (v_i,)),
-            # randomness='different'
+            randomness='same'
         )(v)                                  # shapes: (n_vecs, batch, …)
     
         # xt_next is repeated n_vecs times; pick the first
@@ -503,7 +503,6 @@ class DiffusionSampler(DiffusionModel):
                 log_q = self.prior.log_likelihood(
                     output_dict["prior"],
                     prior_kwargs["temperatures"],
-                    sample_type="sample_from_fit",
                 )                                                         # already (B,)
                 output_dict["log_q"] = log_q
         
@@ -514,17 +513,19 @@ class DiffusionSampler(DiffusionModel):
         elif mode == 'reverse':
             output_dict['target'] = xt.detach().numpy()
             if likelihood:
-                div_arr = np.array(div_list)
+                div_t   = torch.stack(div_list, dim=0)                    # (T-1, B)
+                betas_t = self.DP.betas[:].to(div_t)                     # (T-1,)
                 # Integrate the divergence
-                delta_log_pq = np.trapz(div_arr, self.DP.betas.numpy()[::-1], axis=0)
+                delta_log_pq = torch.trapz(div_t, betas_t.flip(0), dim=0)
 
-                # Double check this -- I don't anticipate this being used but provided for completeness.
                 output_dict['delta_log_pq'] = delta_log_pq
                 log_q = self.prior.log_likelihood(output_dict['prior'], 
                                                   prior_kwargs['temperatures'],
-                                                  sample_type='sample_from_fit').mean(dim=(1, 2))
+                                                  # sample_type='sample_from_fit'
+                                                 )
+                    # .mean(dim=(1, 2))
                 output_dict['log_q'] = log_q
-                output_dict['log_p'] = log_q - delta_log_qp
+                output_dict['log_p'] = log_q + delta_log_pq
     
         return output_dict
 
