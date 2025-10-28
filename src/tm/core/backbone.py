@@ -256,3 +256,56 @@ class GraphBackbone(Backbone):
     def forward(self, batch, t):
         """Forward pass of the GraphBackbone."""
         pass
+
+class MLPBackbone(Backbone):
+    def __init__(
+        self,
+        model,
+        lr=1e-3,
+        optim=None,
+        scheduler=None,
+        eval_mode="train",
+        self_condition=False,
+    ):
+        super().__init__(
+            model=model,
+            data_shape=0,
+            target_shape=0,
+            num_dims=3,        # <— expect (N, C, L)
+            lr=lr,
+            optim=optim,
+            scheduler=scheduler,
+            interpolate=False,
+        )
+        self.eval_mode = eval_mode
+        self.self_condition = self_condition
+
+    # remove _flatten_if_needed entirely
+
+    def _coerce_time_1d(self, t: torch.Tensor) -> torch.Tensor:
+        # Convert (N,1,1) or (N,1) or (N,) -> (N,)
+        if t.dim() == 1:
+            return t
+        return t.view(t.size(0), -1)[:, 0]
+
+    def get_self_condition(self, data, t):
+        t1d = self._coerce_time_1d(t).to(self.device)
+        if self.eval_mode == "train" and self.self_condition:
+            if torch.rand(1) < 0.5:
+                with torch.no_grad():
+                    return self.model(x=data.to(self.device), time=t1d)
+            else:
+                return None
+        elif self.eval_mode == "sample" and self.self_condition:
+            return self.model(x=data.to(self.device), time=t1d)
+        else:
+            return None
+
+    def forward(self, batch, t):
+        x = batch.to(self.device)              # keep (N, C, L), do NOT flatten
+        t1d = self._coerce_time_1d(t).to(self.device)
+
+        x_self = self.get_self_condition(x, t)
+        out = self.model(x=x, time=t1d, x_self_cond=x_self)
+        return out.to("cpu")
+
