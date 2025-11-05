@@ -104,21 +104,17 @@ class DiffusionModel:
     @staticmethod
     def get_adjacent_times(times, reverse=False):
         """
-        Pairs t with t_next for all times in the time-discretization
-        of the diffusion process.
-
-        Args:
-            times (torch.Tensor): Array of time steps.
-            reverse (bool): Direction of pairing.
-
-        Returns:
-            list: List of (t, t_next) tuples.
+        Pair times as (t, t_next).
+    
+        forward: (0,1), (1,2), ..., (T-2, T-1)
+        reverse: (T-1, T-2), ..., (1,0)
         """
         if reverse:
-            times_next = torch.cat((torch.tensor([0], dtype=torch.long), times[:-1]))
-            return list(zip(reversed(times), reversed(times_next)))
+            rev = times.flip(0)          # e.g. [T-1, ..., 0]
+            return list(zip(rev[:-1], rev[1:]))   # (T-1,T-2), ..., (1,0)
         else:
             return list(zip(times[:-1], times[1:]))
+
 
 
 class DiffusionTrainer(DiffusionModel):
@@ -514,7 +510,7 @@ class DiffusionSampler(DiffusionModel):
             output_dict['target'] = xt.detach().numpy()
             if likelihood:
                 div_t   = torch.stack(div_list, dim=0)                    # (T-1, B)
-                betas_t = self.DP.betas[:].to(div_t)                     # (T-1,)
+                betas_t = self.DP.betas[1:].to(div_t)                     # (T-1,)
                 # Integrate the divergence
                 delta_log_pq = torch.trapz(div_t, betas_t.flip(0), dim=0)
 

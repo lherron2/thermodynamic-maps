@@ -57,7 +57,7 @@ class Backbone(nn.Module):
 
         #self.model = model.to(self.device)
 
-        self.model = nn.DataParallel(model)
+        self.model = model
         if torch.cuda.is_available():
             device = torch.device("cuda")
             self.model.to(device)

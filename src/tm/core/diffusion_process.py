@@ -28,28 +28,43 @@ def polynomial_noise(t, alpha_max, alpha_min, s=1e-5, **kwargs):
     betas = 1 - a
     return betas, alpha_schedule
 
+
 # def cosine_noise_schedule(t: torch.Tensor, s: float = 0.001, **kwargs):
 #     timesteps = kwargs.get("timesteps", t[-1])
+
+#     # Raw cumulative alphas
 #     alphas_cumprod = torch.cos(((t / timesteps) + s) / (1 + s) * (math.pi / 2)) ** 2
 #     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-#     betas = alphas_cumprod[1:] / alphas_cumprod[:-1]    
-#     betas = 1 - torch.clamp(betas, 0, 0.999)
-#     alphas_cumprod = torch.clamp(alphas_cumprod, 0, 0.999)
+#     alphas_cumprod = torch.clamp(alphas_cumprod, 0.0, 0.999)
+    
+#     alphas_ratio = alphas_cumprod[1:] / alphas_cumprod[:-1]
+#     betas = 1.0 - alphas_ratio             # derive betas from clamped alphas
+#     betas = torch.clamp(betas, 0.0, 0.999)
+    
 #     return betas, alphas_cumprod[:-1]
 
 def cosine_noise_schedule(t: torch.Tensor, s: float = 0.001, **kwargs):
-    timesteps = kwargs.get("timesteps", t[-1])
+    """
+    Returns:
+        betas[t]          = β_t, shape (T,)
+        alphas_cumprod[t] = \bar{α}_t, shape (T,)
+    where T = len(t) - 1.
+    """
+    T = t[-1].item()  # e.g. T
+    steps = torch.arange(T + 1, device=t.device, dtype=t.dtype)  # 0..T
 
-    # Raw cumulative alphas
-    alphas_cumprod = torch.cos(((t / timesteps) + s) / (1 + s) * (math.pi / 2)) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    alphas_cumprod = torch.clamp(alphas_cumprod, 0.0, 0.999)
-    
-    alphas_ratio = alphas_cumprod[1:] / alphas_cumprod[:-1]
-    betas = 1.0 - alphas_ratio             # derive betas from clamped alphas
-    betas = torch.clamp(betas, 0.0, 0.999)
-    
-    return betas, alphas_cumprod[:-1]
+    raw = torch.cos(((steps / T) + s) / (1 + s) * (math.pi / 2)) ** 2
+    raw = raw / raw[0]
+    raw = torch.clamp(raw, 0.0, 0.999)
+
+    # bar_alpha_0..bar_alpha_{T-1}: length T
+    alphas_cumprod = raw[:-1]                           # (T,)
+
+    # per-step ratio a_t = bar_alpha_{t+1} / bar_alpha_t
+    a = raw[1:] / raw[:-1]                              # (T,)
+    betas = torch.clamp(1.0 - a, 0.0, 0.999)            # (T,)
+
+    return betas, alphas_cumprod
 
 
 NOISE_FUNCS = {
@@ -85,11 +100,20 @@ class DiffusionProcess:
             NOISE_FUNCS (dict): Dictionary of noise functions.
         """
         self.num_diffusion_timesteps = num_diffusion_timesteps
-        self.times = torch.arange(num_diffusion_timesteps)
-        self.betas, self.alphas = NOISE_FUNCS[noise_schedule](                
-            t=torch.arange(num_diffusion_timesteps+1), alpha_max=alpha_max, alpha_min=alpha_min,
-                beta_start=beta_start, beta_end=beta_end
-            )
+        self.times = torch.arange(num_diffusion_timesteps)  # 0..T-1
+
+        betas, alphas_cumprod = NOISE_FUNCS[noise_schedule](
+            t=torch.arange(num_diffusion_timesteps + 1),
+            alpha_max=alpha_max,
+            alpha_min=alpha_min,
+            beta_start=beta_start,
+            beta_end=beta_end,
+        )
+
+        # shapes: (T,)
+        self.betas = betas
+        self.alphas = 1.0 - self.betas          # per-step α_t
+        self.alphas_cumprod = alphas_cumprod    # bar_alpha_t, length T
 
 
 class VPDiffusion(DiffusionProcess):
@@ -126,7 +150,21 @@ class VPDiffusion(DiffusionProcess):
             beta_end,
             NOISE_FUNCS
         )
-        self.bmul = vmap(torch.mul)
+        # self.bmul = vmap(torch.mul)
+        
+    @staticmethod
+    def _scale_like(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """
+        Broadcast scalar/timestep coefficients s to have same shape as x
+        along non-batch dimensions and multiply.
+        s is assumed to have shape (B,) or ().
+        """
+        if s.ndim == 0:
+            return x * s
+        # assume batch dim = 0
+        while s.ndim < x.ndim:
+            s = s.view(-1, *([1] * (x.ndim - 1)))
+        return x * s
 
     def get_alphas(self):
         """
@@ -168,171 +206,130 @@ class VPDiffusion(DiffusionProcess):
 
     def _forward_kernel_jump(self, x, t, prior, **prior_kwargs):
         """
-        Modified forward marginal transition kernel that jumps from time t to jump_t in a single step.
+        Forward "jump" kernel: q(x_t | x_0) using cumulative alphas:
     
-        In our formulation, we first recover:
-            x_0 = (x_t - sqrt(1 - α_t)*noise) / sqrt(α_t)
-        and then jump directly to time jump_t:
-            x_{jump_t} = sqrt(α_{jump_t}) * x_0 + sqrt(1 - α_{jump_t}) * noise
-    
-        Args:
-            x_t (torch.Tensor): Data at time t.
-            t (int): Current time step.
-            jump_t (int): Target time step to jump to (must be greater than t).
-            prior: Prior distribution used to sample noise.
-            **prior_kwargs: Additional keyword arguments for the prior.
-    
-        Returns:
-            tuple: (x_{jump_t}, noise, score)
+            x_t = sqrt(bar_alpha_t) * x_0 + sqrt(1 - bar_alpha_t) * eps
         """
-        alphas_t = self.alphas[t]
+        # t: (B,) integer timesteps, x: (B, C, ...)
+        bar_alpha_t = self.alphas_cumprod[t]          # (B,)
+        noise = prior.sample(**prior_kwargs)          # same shape as x
     
-        noise = prior.sample(**prior_kwargs)
-        x_jump = self.bmul(x, alphas_t.sqrt()) + self.bmul(noise, (1-alphas_t).sqrt())
+        x_jump = self._scale_like(x, bar_alpha_t.sqrt()) + \
+                 self._scale_like(noise, (1.0 - bar_alpha_t).sqrt())
+    
         return x_jump, noise, None
-
 
     def _forward_kernel_prior_noise(self, x_t, t, prior, **prior_kwargs):
         """
-        Modified forward marginal transition kernel that inverts the reverse diffusion step.
+        Markov forward kernel using per-step α_t:
     
-        Given:
-          x0 = (x_t - sqrt(1-α_t)*noise) / sqrt(α_t)
-        we form the next state as:
-          x_{t+1} = sqrt(α_{t+1})*x0 + sqrt(1-α_{t+1})*noise
-    
-        Args:
-            x_t (torch.Tensor): Data at time t.
-            t (int): Current time step.
-            prior: Prior distribution.
-            **prior_kwargs: Additional keyword arguments.
-    
-        Returns:
-            tuple: (x_{t+1}, noise, score)
+            x_{t+1} = sqrt(alpha_t) * x_t + sqrt(1 - alpha_t) * eps
         """
-        beta_t = self.betas[t]
+        alpha_t = self.alphas[t]                    # α_t = 1 - β_t
         noise = prior.sample(**prior_kwargs)
-        x_t_next = self.bmul((1-beta_t).sqrt(), x_t) + self.bmul((beta_t).sqrt(), noise)    
-        score = None
-        
-        return x_t_next, noise, score
     
-    def _forward_kernel_network_noise(self, x_t, t, prior, backbone, network_pred_type, **kwargs):
+        x_t_next = self._scale_like(x_t, alpha_t.sqrt()) + \
+                   self._scale_like(noise, (1.0 - alpha_t).sqrt())
+    
+        return x_t_next, noise, None
+    
+    def _forward_kernel_network_noise(self, x_t, t, prior, backbone, network_pred_type,
+                                      t_next=None, **kwargs):
         """
-        Modified forward kernel using network-predicted noise or x0 to invert the reverse diffusion step.
+        Forward kernel using the network-predicted noise or x0, consistent with the
+        training distribution q(x_t | x_0) defined by alphas_cumprod.
     
-        In the reverse kernel you recover:
-            If pred_type=="noise":
-               x0 = (x_t - sqrt(1-α_t)*noise) / sqrt(α_t)
-            If pred_type=="x0":
-               x0 = backbone(x_t, α_t)
-        
-        Then in the forward process we reconstruct:
-             x_{t+1} = sqrt(α_{t+1}) * x0 + sqrt(1-α_{t+1}) * noise
+        If network_pred_type == "noise":
+            eps_pred = backbone(x_t, alpha_bar_t)
+            x0_t = (x_t - sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_bar_t)
+            x_{t_next} = sqrt(alpha_bar_{t_next}) * x0_t + sqrt(1 - alpha_bar_{t_next}) * eps_pred
     
-        Args:
-            x_t (torch.Tensor): Data at time t.
-            t (int): Current time step.
-            prior: Prior distribution (not used here but kept for API consistency).
-            backbone: Backbone model.
-            pred_type (str): Either 'noise' or 'x0'.
-            **kwargs: Additional keyword arguments.
-    
-        Returns:
-            tuple: (x_{t+1}, noise, score)
+        If network_pred_type == "x0":
+            x0_t = backbone(x_t, alpha_bar_t)
+            eps_pred = (x_t - sqrt(alpha_bar_t) * x0_t) / sqrt(1 - alpha_bar_t)
         """
-        alpha_t = self.alphas[t]
-        alpha_t_next = self.alphas[t+1]
-        beta_t = self.betas[t]
-        
+        if t_next is None:
+            # assume t_next = t+1 if not provided
+            t_next = t + 1
+    
+        bar_alpha_t = self.alphas_cumprod[t]        # (B,)
+        bar_alpha_next = self.alphas_cumprod[t_next]
+    
         if network_pred_type == "noise":
-            noise = backbone(x_t, alpha_t)
-            noise_rescaled = self.bmul(noise, (1 - alpha_t).sqrt())
-            x0_t = self.bmul(x_t - noise_rescaled, 1 / (alpha_t).sqrt())
-
+            eps_pred = backbone(x_t, bar_alpha_t)
+            noise_rescaled = self._scale_like(eps_pred, (1.0 - bar_alpha_t).sqrt())
+            x0_t = self._scale_like(x_t - noise_rescaled, 1.0 / bar_alpha_t.sqrt())
+    
         elif network_pred_type == "x0":
-            x0_t = backbone(x_t, alpha_t)
-            noise = (x_t - x0_t * alpha_t.sqrt()) / (1 - alpha_t).sqrt()
-
+            x0_t = backbone(x_t, bar_alpha_t)
+            eps_pred = (x_t - self._scale_like(x0_t, bar_alpha_t.sqrt())) / \
+                       (1.0 - bar_alpha_t).sqrt()
+    
         else:
             raise ValueError("network_pred_type must be 'noise' or 'x0'")
+    
+        x_t_next = self._scale_like(x0_t, bar_alpha_next.sqrt()) + \
+                   self._scale_like(eps_pred, (1.0 - bar_alpha_next).sqrt())
+    
+        return x_t_next, eps_pred, None
 
-        # x_t_next = self.bmul((1-beta_t).sqrt(), x_t) + self.bmul((beta_t).sqrt(), noise)
-        x_t_next = self.bmul(alpha_t_next.sqrt(), x0_t) + self.bmul((1 - alpha_t_next).sqrt(), noise)
-        
-        # Compute the score (adjust as necessary).
-        score = None
-        
-        return x_t_next, noise, score
 
     def _reverse_kernel(self, x_t, t, backbone, network_pred_type, **kwargs):
         """
-        Reverse marginal transition kernel p(x0 | x_t).
-
-        Args:
-            x_t (torch.Tensor): Data at time t.
-            t (int): Time step.
-            backbone: Backbone model.
-            pred_type (str): Type of prediction ('noise' or 'x0').
-
-        Returns:
-            tuple: (x0_t, noise)
+        Reverse kernel stepping t -> t-1:
+    
+            x_prev = sqrt(bar_alpha_{t-1}) * x0_t + sqrt(1 - bar_alpha_{t-1}) * eps_pred
+    
+        where x0_t and eps_pred are reconstructed from x_t using the same
+        bar_alpha_t that defined q(x_t | x_0) in training.
         """
-
-        alpha_t = self.alphas[t]
-        alpha_t_next = self.alphas[t-1]
-        beta_t = self.betas[t]
-
-        # reverse_variance = (1 - alpha_t_next)/(1 - alpha_t) * (1-beta_t)
-
+        # t: (B,)
+        bar_alpha_t = self.alphas_cumprod[t]                # (B,)
+    
+        # Define bar_alpha_{t-1}; for t==0 we can treat bar_alpha_{-1} = 1.0
+        t_prev = t - 1
+        t_prev = torch.clamp(t_prev, min=0)
+        bar_alpha_prev = self.alphas_cumprod[t_prev]
+    
         if network_pred_type == "noise":
-            noise = backbone(x_t, alpha_t)
-            noise_rescaled = self.bmul(noise, (1 - alpha_t).sqrt())
-            x0_t = self.bmul(x_t - noise_rescaled,  1 / (alpha_t).sqrt())
-            score = None
+            eps_pred = backbone(x_t, bar_alpha_t)
+            noise_rescaled = self._scale_like(eps_pred, (1.0 - bar_alpha_t).sqrt())
+            x0_t = self._scale_like(x_t - noise_rescaled, 1.0 / bar_alpha_t.sqrt())
+    
         elif network_pred_type == "x0":
-            x0_t = backbone(x_t, alpha_t)
-            noise = (x_t - x0_t * alpha_t.sqrt()) / (1 - alpha_t).sqrt()
-            score = None
+            x0_t = backbone(x_t, bar_alpha_t)
+            eps_pred = (x_t - self._scale_like(x0_t, bar_alpha_t.sqrt())) / \
+                       (1.0 - bar_alpha_t).sqrt()
         else:
             raise ValueError("Please provide a valid prediction type: 'noise' or 'x0'")
-        
-        x_t_next = self.bmul((alpha_t_next).sqrt(), x0_t) + self.bmul((1-alpha_t_next).sqrt(), noise)
-        
-        return x_t_next, noise, score
+    
+        x_t_prev = self._scale_like(x0_t, bar_alpha_prev.sqrt()) + \
+                   self._scale_like(eps_pred, (1.0 - bar_alpha_prev).sqrt())
+    
+        return x_t_prev, eps_pred, None
+
 
     def _reverse_kernel_jump(self, x_t, t, backbone, network_pred_type, **kwargs):
         """
-        Reverse marginal transition kernel p(x0 | x_t).
-
-        Args:
-            x_t (torch.Tensor): Data at time t.
-            t (int): Time step.
-            backbone: Backbone model.
-            pred_type (str): Type of prediction ('noise' or 'x0').
-
-        Returns:
-            tuple: (x0_t, noise)
+        Reverse "jump" kernel p(x0 | x_t) used in training:
+    
+            x0_t = (x_t - sqrt(1 - bar_alpha_t) * eps_pred) / sqrt(bar_alpha_t)
         """
-        alpha_t = self.alphas[t]
-        alpha_t_next = self.alphas[t-1]
-        beta_t = self.betas[t]
-
-        # reverse_variance = (1 - alpha_t_next)/(1 - alpha_t) * (1-beta_t)
-
+        bar_alpha_t = self.alphas_cumprod[t]
+    
         if network_pred_type == "noise":
-            noise = backbone(x_t, alpha_t)
-            noise_rescaled = self.bmul(noise, (1 - alpha_t).sqrt())
-            x0_t = self.bmul((x_t - noise_rescaled), 1 / (alpha_t).sqrt())
-            score = None
+            eps_pred = backbone(x_t, bar_alpha_t)
+            noise_rescaled = self._scale_like(eps_pred, (1.0 - bar_alpha_t).sqrt())
+            x0_t = self._scale_like(x_t - noise_rescaled, 1.0 / bar_alpha_t.sqrt())
         elif network_pred_type == "x0":
-            x0_t = backbone(x_t, alpha_t)
-            noise = (x_t - x0_t * alpha_t.sqrt()) / (1 - alpha_t).sqrt()
-            score = None
+            x0_t = backbone(x_t, bar_alpha_t)
+            eps_pred = (x_t - self._scale_like(x0_t, bar_alpha_t.sqrt())) / \
+                       (1.0 - bar_alpha_t).sqrt()
         else:
             raise ValueError("Please provide a valid prediction type: 'noise' or 'x0'")
-                
-        return x0_t, noise, score
+    
+        return x0_t, eps_pred, None
+
 
     def step(self, mode, x, t, t_next, backbone=None, network_pred_type=None, 
              prior=None, likelihood=False, control_dict=None, gamma=None, **kwargs):
@@ -357,19 +354,19 @@ class VPDiffusion(DiffusionProcess):
             torch.Tensor: Updated data state (x_{t+1} for forward, x_{t-1} for reverse).
         """
         if mode == "forward":
-            # The forward kernel (via self.kernel) returns (x_t_next, noise)
             x_next, noise, _ = self.kernel(
                 mode="forward",
                 x_t=x,
                 t=t,
+                t_next=t_next,                 # <-- pass t_next through
                 prior=prior,
                 likelihood=likelihood,
                 backbone=backbone,
                 network_pred_type=network_pred_type,
                 **kwargs
             )
+    
         elif mode == "reverse":
-            # The reverse kernel returns (x0, noise)
             x_next, noise, _ = self.kernel(
                 mode="reverse",
                 x_t=x,
@@ -378,10 +375,9 @@ class VPDiffusion(DiffusionProcess):
                 network_pred_type=network_pred_type,
                 **kwargs
             )
-
+    
         else:
             raise ValueError("Mode must be 'forward' or 'reverse'")
-    
         # Optionally apply channel-wise control.
         if control_dict:
             for channel, channel_control in control_dict.items():

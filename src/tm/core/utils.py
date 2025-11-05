@@ -48,6 +48,13 @@ def compute_model_dim(data_dim, groups):
     """
     return int(np.ceil(data_dim / groups) * groups)
 
+def next_divisible_by_groups(n, groups):
+    remainder = n % groups
+    if remainder == 0:
+        return n  # The number is already divisible by 'groups'
+    else:
+        return n + (groups - remainder)
+
 
 class Interpolater:
     """
