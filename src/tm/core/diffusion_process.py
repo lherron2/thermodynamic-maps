@@ -28,14 +28,29 @@ def polynomial_noise(t, alpha_max, alpha_min, s=1e-5, **kwargs):
     betas = 1 - a
     return betas, alpha_schedule
 
+# def cosine_noise_schedule(t: torch.Tensor, s: float = 0.001, **kwargs):
+#     timesteps = kwargs.get("timesteps", t[-1])
+#     alphas_cumprod = torch.cos(((t / timesteps) + s) / (1 + s) * (math.pi / 2)) ** 2
+#     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+#     betas = alphas_cumprod[1:] / alphas_cumprod[:-1]    
+#     betas = 1 - torch.clamp(betas, 0, 0.999)
+#     alphas_cumprod = torch.clamp(alphas_cumprod, 0, 0.999)
+#     return betas, alphas_cumprod[:-1]
+
 def cosine_noise_schedule(t: torch.Tensor, s: float = 0.001, **kwargs):
     timesteps = kwargs.get("timesteps", t[-1])
+
+    # Raw cumulative alphas
     alphas_cumprod = torch.cos(((t / timesteps) + s) / (1 + s) * (math.pi / 2)) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = alphas_cumprod[1:] / alphas_cumprod[:-1]    
-    betas = 1 - torch.clamp(betas, 0, 0.999)
-    alphas_cumprod = torch.clamp(alphas_cumprod, 0, 0.999)
+    alphas_cumprod = torch.clamp(alphas_cumprod, 0.0, 0.999)
+    
+    alphas_ratio = alphas_cumprod[1:] / alphas_cumprod[:-1]
+    betas = 1.0 - alphas_ratio             # derive betas from clamped alphas
+    betas = torch.clamp(betas, 0.0, 0.999)
+    
     return betas, alphas_cumprod[:-1]
+
 
 NOISE_FUNCS = {
     "polynomial": polynomial_noise,
@@ -75,6 +90,7 @@ class DiffusionProcess:
             t=torch.arange(num_diffusion_timesteps+1), alpha_max=alpha_max, alpha_min=alpha_min,
                 beta_start=beta_start, beta_end=beta_end
             )
+
 
 class VPDiffusion(DiffusionProcess):
     """
@@ -226,7 +242,7 @@ class VPDiffusion(DiffusionProcess):
             tuple: (x_{t+1}, noise, score)
         """
         alpha_t = self.alphas[t]
-        alpha_t_next = self.alphas[t + 1]
+        alpha_t_next = self.alphas[t+1]
         beta_t = self.betas[t]
         
         if network_pred_type == "noise":
@@ -262,6 +278,7 @@ class VPDiffusion(DiffusionProcess):
         Returns:
             tuple: (x0_t, noise)
         """
+
         alpha_t = self.alphas[t]
         alpha_t_next = self.alphas[t-1]
         beta_t = self.betas[t]
@@ -280,7 +297,7 @@ class VPDiffusion(DiffusionProcess):
         else:
             raise ValueError("Please provide a valid prediction type: 'noise' or 'x0'")
         
-        x_t_next = self.bmul(alpha_t_next.sqrt(), x0_t) + self.bmul((1-alpha_t_next).sqrt(), noise)
+        x_t_next = self.bmul((alpha_t_next).sqrt(), x0_t) + self.bmul((1-alpha_t_next).sqrt(), noise)
         
         return x_t_next, noise, score
 
@@ -301,7 +318,7 @@ class VPDiffusion(DiffusionProcess):
         alpha_t_next = self.alphas[t-1]
         beta_t = self.betas[t]
 
-        reverse_variance = (1 - alpha_t_next)/(1 - alpha_t) * (1-beta_t)
+        # reverse_variance = (1 - alpha_t_next)/(1 - alpha_t) * (1-beta_t)
 
         if network_pred_type == "noise":
             noise = backbone(x_t, alpha_t)
